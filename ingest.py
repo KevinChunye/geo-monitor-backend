@@ -57,6 +57,13 @@ ALLOWLIST_QUALITY = {
     "www.reuters.com": "MAJOR_MEDIA",
 }
 
+# Drop obvious SEO/finance-blog spam when the source is already classified as OTHER.
+DOMAIN_BLOCKLIST = {
+    "insidermonkey.com",
+    "tickerreport.com",
+    "themarketsdaily.com",
+}
+
 # NOTE: You MUST fill FEEDS with actual State Dept RSS feed URLs.
 # The directory page is not itself a feed.
 STATE_DEPT_FEEDS: List[str] = [
@@ -87,6 +94,19 @@ def _quality_from_url(url: str) -> str:
     return ALLOWLIST_QUALITY.get(d, "OTHER")
 
 
+def _should_drop(url: str) -> bool:
+    """Best-effort spam filter. Only drops when the domain is untrusted (OTHER)."""
+    d = _domain(url)
+    q = _quality_from_url(url)
+    return (q == "OTHER") and (d in DOMAIN_BLOCKLIST)
+
+
+def _clean_summary(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def _is_copper(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in COPPER_KW)
@@ -99,6 +119,21 @@ def _risk_types(text: str) -> List[str]:
         if any(kw in t for kw in kws):
             out.append(risk)
     return out or ["other"]
+
+
+WHY_IT_MATTERS = {
+    "policy": "Potential policy/regulatory change that can affect permitting, exports, taxes, or investment conditions.",
+    "logistics": "Potential disruption to transport/ports/shipping that can delay concentrates/cathodes and tighten supply.",
+    "labor": "Labor action risk (strike/protest) that can reduce mine/smelter throughput and impact TCRCs/availability.",
+    "conflict": "Conflict/security risk that can disrupt operations, infrastructure, or trade routes.",
+    "sanctions": "Sanctions/designations risk that can affect counterparties, payments, shipping, and trade compliance.",
+    "other": "Potential market-moving development; verify details and linkage to the copper supply chain.",
+}
+
+
+def _why_it_matters(risks: List[str]) -> str:
+    r = (risks[0] if risks else "other")
+    return WHY_IT_MATTERS.get(r, WHY_IT_MATTERS["other"])
 
 
 def _severity(text: str, risks: List[str]) -> int:
@@ -134,12 +169,21 @@ def _mk_event(
     source_name: str,
     published_at: str,
     location: Optional[Dict[str, Any]] = None,
+    force_include: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Build a normalized event matching the frontend schema.
     """
+    if _should_drop(url):
+        return None
+
+    summary = _clean_summary(summary)
+    if not summary and title:
+        # fallback so UI never shows blank summaries
+        summary = " ".join(title.split()[:28])
+
     text = f"{title} {summary}"
-    if not _is_copper(text):
+    if (not force_include) and (not _is_copper(text)):
         return None
 
     risks = _risk_types(text)
@@ -148,11 +192,13 @@ def _mk_event(
     # MVP: no real geocoding yet. Keep placeholder "Global" unless you add NER+geocode later.
     loc = location or {"name": "Global", "lat": 0.0, "lon": 0.0, "precision": "country"}
 
+    why = _why_it_matters(risks)
+
     return {
         "id": _id(url + "|" + title),
         "title": (title or "")[:500],
         "summary": (summary or "")[:240],
-        "whyItMatters": "May affect copper supply/demand via mining, refining, or logistics constraints.",
+        "whyItMatters": why,
         "sourceUrl": url,
         "sourceName": source_name,
         "sourceQuality": _quality_from_url(url),
@@ -328,7 +374,11 @@ def scrape_treasury_press_releases() -> List[Dict[str, Any]]:
         # Only keep actual press release detail pages
         if "/news/press-releases/" in href and len(text) > 15:
             full = href if href.startswith("http") else "https://home.treasury.gov" + href
-            ev = _mk_event(text, "", full, "U.S. Treasury", _nowz())
+            # Treasury press releases may matter even if "copper" isn't mentioned.
+            # Keep only if it's geopolicy-relevant OR copper-relevant.
+            risks = _risk_types(text)
+            force = (risks != ["other"]) or _is_copper(text)
+            ev = _mk_event(text, "", full, "U.S. Treasury", _nowz(), force_include=force)
             if ev:
                 out.append(ev)
 
@@ -361,7 +411,8 @@ def scrape_ofac_recent_actions() -> List[Dict[str, Any]]:
         # Recent Actions detail pages
         if "/recent-actions/" in href:
             full = href if href.startswith("http") else "https://ofac.treasury.gov" + href
-            ev = _mk_event(text, "", full, "OFAC", _nowz())
+            # OFAC is inherently sanctions/policy-oriented; include even if "copper" isn't in the title.
+            ev = _mk_event(text, "", full, "OFAC", _nowz(), force_include=True)
             if ev:
                 out.append(ev)
 
@@ -409,6 +460,7 @@ def run_all(days: int = 7) -> List[Dict[str, Any]]:
     """
     sources: List[Tuple[str, Callable[[], List[Dict[str, Any]]]]] = [
         ("GDELT", lambda: ingest_gdelt(days)),
+        ("Mining.com RSS", ingest_mining_rss),
         # ("Mining.com via GDELT", lambda: ingest_gdelt_domain(days, "mining.com", "Mining.com")),
         ("Treasury PR", scrape_treasury_press_releases),
         ("OFAC Recent Actions", scrape_ofac_recent_actions),

@@ -59,11 +59,18 @@ def get_events(
     material: str = Query("copper"),
     days: int = Query(7, ge=1, le=30),
     risk: str | None = Query(None),
-    quality: str | None = Query(None),
+    # Default hides low-quality SEO/finance-blog spam. Set quality=ALL to include everything.
+    quality: str | None = Query("OFFICIAL,MAJOR_MEDIA,INDUSTRY"),
     limit: int = Query(200, ge=1, le=500),
 ):
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00","Z")
-    evs = query_events(material, cutoff, risk, quality, limit=limit)
+
+    qualities = None
+    if quality:
+        if quality.strip().upper() != "ALL":
+            qualities = {q.strip().upper() for q in quality.split(",") if q.strip()}
+
+    evs = query_events(material, cutoff, risk, qualities, limit=limit)
     return {
         "events": evs,
         "count": len(evs),
