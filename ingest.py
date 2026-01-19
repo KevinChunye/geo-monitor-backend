@@ -224,42 +224,75 @@ def _parse_dt_to_z(dt_str: str) -> str:
 # Source ingestors
 # ----------------------------
 def ingest_mining_rss() -> List[Dict[str, Any]]:
-    FEED_URL = "https://www.mining.com/feed/"
+    """
+    Mining.com RSS.
 
-    r = requests.get(
-        FEED_URL,
-        timeout=(5, 20),
-        headers={"User-Agent": "geo-monitor/1.0", "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8"},
-    )
-    r.raise_for_status()
+    Mining.com frequently changes RSS endpoints, and some endpoints can return 403 to non-browser user agents.
+    This ingestor:
+    - Tries multiple candidate feed URLs
+    - Uses a browser-like User-Agent
+    - Never crashes ingestion if Mining.com blocks us
+    """
 
-    # IMPORTANT: pass bytes, not decoded text
-    feed = feedparser.parse(r.content)
+    FEED_URLS = [
+        # Most common WordPress RSS locations
+        "https://www.mining.com/feed/",
+        "https://www.mining.com/feed",
+        "https://mining.com/feed/",
+        "https://mining.com/feed",
+        # Fallback WP query style
+        "https://www.mining.com/?feed=rss2",
+        "https://mining.com/?feed=rss2",
+    ]
 
-    # feedparser doesn't throw; it sets bozo flag on parse issues
-    if getattr(feed, "bozo", False):
-        # Don’t kill ingestion—just skip Mining.com if it’s malformed today
-        print(f"[Mining.com] RSS parse error (bozo): {getattr(feed, 'bozo_exception', None)}", flush=True)
-        return []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GeoMonitorBot/1.0; +https://critical-material-geotracking.onrender.com)",
+        "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
 
-    entries = getattr(feed, "entries", []) or []
-    if not entries:
-        print("[Mining.com] RSS returned 0 entries.", flush=True)
-        return []
+    last_err: Exception | None = None
 
-    out: List[Dict[str, Any]] = []
-    for e in entries[:200]:
-        title = getattr(e, "title", "") or ""
-        url = getattr(e, "link", "") or ""
-        summary = getattr(e, "summary", "") or ""
-        published = getattr(e, "published", "") or ""
+    for feed_url in FEED_URLS:
+        try:
+            r = requests.get(feed_url, timeout=(5, 20), headers=headers)
+            r.raise_for_status()
 
-        published_at = _parse_dt_to_z(published)
-        ev = _mk_event(title, summary, url, "Mining.com", published_at)
-        if ev:
-            out.append(ev)
+            feed = feedparser.parse(r.content)  # bytes, not text
+            if getattr(feed, "bozo", False):
+                print(f"[Mining.com] RSS parse error (bozo) for {feed_url}: {getattr(feed,'bozo_exception',None)}", flush=True)
+                continue
 
-    return out
+            entries = getattr(feed, "entries", []) or []
+            if not entries:
+                print(f"[Mining.com] RSS returned 0 entries for {feed_url}.", flush=True)
+                continue
+
+            out: List[Dict[str, Any]] = []
+            for e in entries[:200]:
+                title = getattr(e, "title", "") or ""
+                url = getattr(e, "link", "") or ""
+                summary = getattr(e, "summary", "") or ""
+                published = getattr(e, "published", "") or ""
+
+                published_at = _parse_dt_to_z(published)
+                ev = _mk_event(title, summary, url, "Mining.com", published_at)
+                if ev:
+                    out.append(ev)
+
+            if out:
+                return out
+            # If feed is reachable but nothing matches copper keywords, still consider it a success.
+            return []
+
+        except Exception as e:
+            last_err = e
+            continue
+
+    # If every endpoint failed, surface a single error for the report (caller will catch it).
+    if last_err:
+        raise last_err
+
+    return []
 
 
 def ingest_gdelt(days: int = 7) -> List[Dict[str, Any]]:
@@ -448,6 +481,69 @@ def ingest_state_rss() -> List[Dict[str, Any]]:
     return out
 
 
+def ingest_eu_consilium_press_releases_rss() -> List[Dict[str, Any]]:
+    """EU Council (consilium.europa.eu) press releases RSS feed."""
+    feed_url = "https://www.consilium.europa.eu/en/rss/pressreleases.ashx"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GeoMonitorBot/1.0; +https://critical-material-geotracking.onrender.com)",
+        "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    r = requests.get(feed_url, timeout=(5, 20), headers=headers)
+    r.raise_for_status()
+
+    feed = feedparser.parse(r.content)
+    if getattr(feed, "bozo", False):
+        print(f"[EU Council] RSS parse error (bozo): {getattr(feed,'bozo_exception',None)}", flush=True)
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for e in getattr(feed, "entries", [])[:200]:
+        title = getattr(e, "title", "") or ""
+        url = getattr(e, "link", "") or ""
+        summary = getattr(e, "summary", "") or ""
+        published = getattr(e, "published", "") or ""
+        published_at = _parse_dt_to_z(published)
+
+        # EU Council press releases are inherently policy/geopolitics; include even without "copper" in title.
+        # We'll still let _mk_event drop obvious spam + non-policy items via risk typing.
+        ev = _mk_event(title, summary, url, "EU Council", published_at, force_include=True)
+        if ev:
+            out.append(ev)
+
+    return out
+
+
+def ingest_uk_ofsi_blog_feed() -> List[Dict[str, Any]]:
+    """UK Office of Financial Sanctions Implementation (OFSI) blog feed."""
+    feed_url = "https://ofsi.blog.gov.uk/feed/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GeoMonitorBot/1.0; +https://critical-material-geotracking.onrender.com)",
+        "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    r = requests.get(feed_url, timeout=(5, 20), headers=headers)
+    r.raise_for_status()
+
+    feed = feedparser.parse(r.content)
+    if getattr(feed, "bozo", False):
+        print(f"[UK OFSI] RSS/Atom parse error (bozo): {getattr(feed,'bozo_exception',None)}", flush=True)
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for e in getattr(feed, "entries", [])[:200]:
+        title = getattr(e, "title", "") or ""
+        url = getattr(e, "link", "") or ""
+        summary = getattr(e, "summary", "") or ""
+        published = getattr(e, "published", "") or ""
+        published_at = _parse_dt_to_z(published)
+
+        # OFSI is sanctions/compliance oriented; always include.
+        ev = _mk_event(title, summary, url, "UK OFSI", published_at, force_include=True)
+        if ev:
+            out.append(ev)
+
+    return out
+
+
 # ----------------------------
 # Orchestration (safe / fault tolerant)
 # ----------------------------
@@ -461,6 +557,8 @@ def run_all(days: int = 7) -> List[Dict[str, Any]]:
     sources: List[Tuple[str, Callable[[], List[Dict[str, Any]]]]] = [
         ("GDELT", lambda: ingest_gdelt(days)),
         ("Mining.com RSS", ingest_mining_rss),
+        ("EU Council PR RSS", ingest_eu_consilium_press_releases_rss),
+        ("UK OFSI Blog", ingest_uk_ofsi_blog_feed),
         # ("Mining.com via GDELT", lambda: ingest_gdelt_domain(days, "mining.com", "Mining.com")),
         ("Treasury PR", scrape_treasury_press_releases),
         ("OFAC Recent Actions", scrape_ofac_recent_actions),

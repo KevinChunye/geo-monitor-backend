@@ -17,6 +17,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/")
+def root():
+    return {"service": "Geo Monitor API", "docs": "/docs", "health": "/health"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.on_event("startup")
 def _startup():
     init_db()
@@ -57,7 +67,7 @@ def ingest_run():
 @app.get("/events")
 def get_events(
     material: str = Query("copper"),
-    days: int = Query(7, ge=1, le=30),
+    days: int = Query(7, ge=1, le=90),
     risk: str | None = Query(None),
     # Default hides low-quality SEO/finance-blog spam. Set quality=ALL to include everything.
     quality: str | None = Query("OFFICIAL,MAJOR_MEDIA,INDUSTRY"),
