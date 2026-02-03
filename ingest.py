@@ -88,6 +88,97 @@ DEFAULT_HEADERS = {
 }
 
 
+
+# ----------------------------
+# Entity & region geo enrichment (higher precision than country keyword)
+# ----------------------------
+# Strategy (conservative):
+# 1) ENTITY_GEO_HINTS (substring match on normalized text) -> precision="entity"
+# 2) REGION_HINTS (regex match on provinces/mining regions) -> precision="region"
+# 3) COUNTRY_HINTS (regex match) -> precision="country"
+# 4) else -> Global fallback
+
+# Format: (substring_keyword_lower, ISO2 list, lat, lon)
+# NOTE: Keep keywords lowercase; matching happens on text.lower().
+ENTITY_GEO_HINTS: List[Tuple[str, List[str], float, float]] = [
+    # --- Africa / Copperbelt / DRC ---
+    ("kamoa-kakula", ["CD"], -10.7390, 25.4580),
+    ("kamoa", ["CD"], -10.7390, 25.4580),
+    ("kakula", ["CD"], -10.7390, 25.4580),
+    ("ivanhoe", ["CD"], -10.7390, 25.4580),
+    ("tenke fungurume", ["CD"], -10.9850, 26.7420),
+    ("tenke", ["CD"], -10.9850, 26.7420),
+    ("fungurume", ["CD"], -10.9850, 26.7420),
+    ("kolwezi", ["CD"], -10.7167, 25.4667),
+    ("lubumbashi", ["CD"], -11.6609, 27.4794),
+    ("kansanshi", ["ZM"], -12.0950, 26.4270),
+    ("lumwana", ["ZM"], -12.2580, 25.7990),
+    ("mopani", ["ZM"], -12.5490, 27.8500),
+    ("konkola", ["ZM"], -12.3790, 27.8240),
+    ("first quantum", ["ZM"], -12.0950, 26.4270),  # Kansanshi/Lumwana anchor
+    ("cmoc", ["CD"], -10.9850, 26.7420),  # Tenke Fungurume (CMOC)
+    ("china molybdenum", ["CD"], -10.9850, 26.7420),
+    ("barrick", ["CD"], -10.9850, 26.7420),  # via JV footprint; conservative centroid
+    ("anglo american", ["ZA"], -30.5595, 22.9375),  # corporate anchor when no asset hint
+    ("kumba", ["ZA"], -30.5595, 22.9375),
+
+    # --- Gems example (your case) ---
+    ("gemfields", ["MZ"], -18.6657, 35.5296),  # Mozambique (Montepuez ruby)
+
+    # --- Chile / Peru copper assets ---
+    ("codelco", ["CL"], -35.6751, -71.5430),
+    ("escondida", ["CL"], -24.2640, -69.0780),
+    ("collahuasi", ["CL"], -20.9560, -68.6500),
+    ("los pelambres", ["CL"], -31.8833, -70.6333),
+    ("antofagasta minerals", ["CL"], -23.6500, -70.4000),
+    ("sqm", ["CL"], -23.6500, -70.4000),
+    ("quellaveco", ["PE"], -16.9920, -70.8550),
+    ("las bambas", ["PE"], -14.7220, -71.3680),
+    ("antamina", ["PE"], -9.7450, -77.1970),
+    ("southern copper", ["PE"], -17.6390, -71.3370),
+    ("freeport-mcmoran", ["US"], 39.8283, -98.5795),  # fallback corporate anchor
+    ("freeport", ["US"], 39.8283, -98.5795),
+
+    # --- North America smelting/refining anchors ---
+    ("glencore horne", ["CA"], 48.2366, -79.0217),  # Rouyn-Noranda
+    ("horne smelter", ["CA"], 48.2366, -79.0217),
+    ("teck", ["CA"], 56.1304, -106.3468),
+    ("hudbay", ["CA"], 56.1304, -106.3468),
+    ("foran mining", ["CA"], 52.9399, -106.4509),
+    ("first majestic", ["CA"], 56.1304, -106.3468),
+
+    # --- Indonesia / Papua ---
+    ("grasberg", ["ID"], -4.0530, 137.1160),
+    ("pt freeport indonesia", ["ID"], -4.0530, 137.1160),
+
+    # --- Australia ---
+    ("bhp", ["AU"], -25.2744, 133.7751),
+    ("rio tinto", ["AU"], -25.2744, 133.7751),
+    ("newmont", ["US"], 39.8283, -98.5795),  # corporate anchor
+]
+
+# Format: (regex_pattern, ISO2, lat, lon)
+REGION_HINTS: List[Tuple[str, str, float, float]] = [
+    # Canada
+    (r"\bbritish columbia\b|\bbc\b", "CA", 53.7267, -127.6476),
+    (r"\bquebec\b", "CA", 52.9399, -73.5491),
+    (r"\bontario\b", "CA", 51.2538, -85.3232),
+    (r"\bsaskatchewan\b", "CA", 52.9399, -106.4509),
+
+    # US
+    (r"\barizona\b", "US", 34.0489, -111.0937),
+    (r"\bnevada\b", "US", 38.8026, -116.4194),
+    (r"\bnew mexico\b", "US", 34.5199, -105.8701),
+
+    # Australia
+    (r"\bwestern australia\b|\bwa\b", "AU", -27.6728, 121.6283),
+    (r"\bqueensland\b", "AU", -20.9176, 142.7028),
+    (r"\bnew south wales\b", "AU", -31.2532, 146.9211),
+
+    # Africa mining regions
+    (r"\bcopperbelt\b", "ZM", -12.0000, 27.0000),
+    (r"\bkatanga\b|\bhaut-katanga\b", "CD", -11.6600, 27.4800),
+]
 # ----------------------------
 # Lightweight geo enrichment
 # ----------------------------
@@ -183,24 +274,56 @@ COUNTRY_HINTS: List[Tuple[str, str, float, float]] = [
 _COUNTRY_HINTS_COMPILED: List[Tuple[re.Pattern, str, float, float]] = [
     (re.compile(pat, re.IGNORECASE), iso2, lat, lon) for pat, iso2, lat, lon in COUNTRY_HINTS
 ]
+_REGION_HINTS_COMPILED: List[Tuple[re.Pattern, str, float, float]] = [
+    (re.compile(pat, re.IGNORECASE), iso2, lat, lon) for pat, iso2, lat, lon in REGION_HINTS
+]
 
 
-def extract_countries_and_centroid(text: str) -> Tuple[List[str], Optional[Tuple[float, float]]]:
+def extract_geo(text: str) -> Tuple[List[str], Optional[Tuple[float, float]], str]:
+    """Return (countries, centroid, precision).
+
+    precision ∈ {"entity","region","country","global"}.
+
+    Conservative policy:
+    - If we can confidently infer from an entity/asset keyword -> entity centroid.
+    - Else if a province/mining region matches -> region centroid.
+    - Else fallback to country keyword centroid.
+    - Else Global.
     """
-    Returns (countries, (lat, lon) or None).
-    - countries: ISO2 codes; can include "EU" placeholder.
-    - centroid: first matched centroid lat/lon.
-    """
-    t = text or ""
+    t = (text or "")
+    tl = t.lower()
+
+    # 1) Entity keywords (substring match)
+    for key, iso2s, lat, lon in ENTITY_GEO_HINTS:
+        if key and key in tl:
+            return iso2s, (float(lat), float(lon)), "entity"
+
+    # 2) Regions (regex)
     hits: List[str] = []
     centroid: Optional[Tuple[float, float]] = None
+    for pat, iso2, lat, lon in _REGION_HINTS_COMPILED:
+        if pat.search(t):
+            if iso2 not in hits:
+                hits.append(iso2)
+            if centroid is None:
+                centroid = (float(lat), float(lon))
+    if hits or centroid:
+        return hits, centroid, "region"
+
+    # 3) Countries (regex)
+    hits = []
+    centroid = None
     for pat, iso2, lat, lon in _COUNTRY_HINTS_COMPILED:
         if pat.search(t):
             if iso2 not in hits:
                 hits.append(iso2)
             if centroid is None:
-                centroid = (lat, lon)
-    return hits, centroid
+                centroid = (float(lat), float(lon))
+    if hits or centroid:
+        return hits, centroid, "country"
+
+    # 4) Global
+    return [], None, "global"
 
 
 # ----------------------------
@@ -375,7 +498,7 @@ def _mk_event(
     sev = _severity(text, risks)
     why = _why_it_matters(risks)
 
-    countries, centroid = extract_countries_and_centroid(text)
+    countries, centroid, precision = extract_geo(text)
 
     # Location precedence:
     # 1) explicit location passed in from ingestor
@@ -385,7 +508,12 @@ def _mk_event(
         loc = location
     elif centroid:
         lat, lon = centroid
-        loc = {"name": (countries[0] if countries else "Global"), "lat": float(lat), "lon": float(lon), "precision": "country"}
+        loc = {
+            "name": (countries[0] if countries else "Global"),
+            "lat": float(lat),
+            "lon": float(lon),
+            "precision": precision,
+        }
     else:
         loc = {"name": "Global", "lat": 0.0, "lon": 0.0, "precision": "global"}
 
