@@ -1,28 +1,24 @@
 # ingest.py
 """
-Ingestion layer for the Geopolitical/Policy Monitor.
+Ingestion layer for the Geopolitical/Policy Monitor (Copper MVP).
 
-Design goals:
-- NEVER crash the whole ingestion if one source fails (skip & continue).
-- Best-effort HTTP with retries/backoff; treat blocks (403/451) as "blocked" and skip.
-- Normalize events into a stable schema for the frontend.
-- Lightweight country + lat/lon enrichment (regex hints -> ISO2 + centroid).
-
-Current sources:
+Sources (MVP):
 - GDELT 2.1 DOC API (discovery)
 - Mining.com RSS (industry)
-- U.S. Treasury press releases (HTML list scrape)
-- OFAC recent actions (HTML list scrape; best-effort)
-- EU Council press releases (RSS)
-- UK OFSI blog (RSS)
-- U.S. State Dept RSS (optional; configure STATE_DEPT_FEEDS)
+- U.S. Treasury press releases page (official HTML list scrape)
+- OFAC recent actions page (official HTML list scrape; may timeout — best-effort)
+- U.S. State Dept RSS feeds (you must fill FEEDS with real RSS URLs)
+
+Design goals:
+- NEVER crash the whole ingestion if one source fails.
+- Return a per-source report via run_all.last_report.
+- Keep event schema compatible with the frontend.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Tuple, Optional
 
@@ -33,20 +29,12 @@ from dateutil import parser as dtparse
 
 
 # ----------------------------
-# Exceptions
-# ----------------------------
-
-class SourceBlocked(RuntimeError):
-    """Raised when a source appears to block automated access (403/451)."""
-
-
-# ----------------------------
 # Configuration
 # ----------------------------
 
 COPPER_KW = [
     "copper", "codelco", "smelter", "smelting", "refining", "refinery",
-    "concentrate", "cathode", "mine", "mining", "tcrc", " cu "
+    "concentrate", "cathode", "mine", "mining", "tcrc", "cu "
 ]
 
 RISK_KW = {
@@ -63,9 +51,6 @@ ALLOWLIST_QUALITY = {
     "ofac.treasury.gov": "OFFICIAL",
     "state.gov": "OFFICIAL",
     "www.state.gov": "OFFICIAL",
-    "www.consilium.europa.eu": "OFFICIAL",
-    "consilium.europa.eu": "OFFICIAL",
-    "ofsi.blog.gov.uk": "OFFICIAL",
     "mining.com": "INDUSTRY",
     "www.mining.com": "INDUSTRY",
     "reuters.com": "MAJOR_MEDIA",
@@ -79,179 +64,16 @@ DOMAIN_BLOCKLIST = {
     "themarketsdaily.com",
 }
 
-# NOTE: You MUST fill STATE_DEPT_FEEDS with actual State Dept RSS feed URLs.
-STATE_DEPT_FEEDS: List[str] = []
-
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; GeoMonitorBot/1.0; +https://critical-material-geotracking.onrender.com)",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
-
-# ----------------------------
-# Lightweight geo enrichment
-# ----------------------------
-# Format: (regex_pattern, ISO2, lat, lon)
-COUNTRY_HINTS: List[Tuple[str, str, float, float]] = [
-    (r"\bunited states\b|\bu\.s\.\b|\busa\b|\bamerica\b", "US", 39.8283, -98.5795),
-    (r"\bcanada\b", "CA", 56.1304, -106.3468),
-    (r"\bmexico\b", "MX", 23.6345, -102.5528),
-    (r"\bchile\b", "CL", -35.6751, -71.5430),
-    (r"\bperu\b", "PE", -9.1900, -75.0152),
-    (r"\bargentina\b", "AR", -38.4161, -63.6167),
-    (r"\bbolivia\b", "BO", -16.2902, -63.5887),
-    (r"\bbrazil\b", "BR", -14.2350, -51.9253),
-    (r"\bcolombia\b", "CO", 4.5709, -74.2973),
-    (r"\becuador\b", "EC", -1.8312, -78.1834),
-    (r"\bpanama\b", "PA", 8.5380, -80.7821),
-    (r"\bvenezuela\b", "VE", 6.4238, -66.5897),
-    (r"\bguatemala\b", "GT", 15.7835, -90.2308),
-    (r"\bhonduras\b", "HN", 15.2000, -86.2419),
-
-    (r"\bunited kingdom\b|\buk\b|\bbritain\b|\bengland\b", "GB", 55.3781, -3.4360),
-    (r"\beuropean union\b|\beu\b", "EU", 50.1109, 8.6821),  # placeholder (Frankfurt)
-    (r"\bfrance\b", "FR", 46.2276, 2.2137),
-    (r"\bgermany\b", "DE", 51.1657, 10.4515),
-    (r"\bitaly\b", "IT", 41.8719, 12.5674),
-    (r"\bspain\b", "ES", 40.4637, -3.7492),
-    (r"\bportugal\b", "PT", 39.3999, -8.2245),
-    (r"\bnetherlands\b|\bholland\b", "NL", 52.1326, 5.2913),
-    (r"\bbelgium\b", "BE", 50.5039, 4.4699),
-    (r"\bpoland\b", "PL", 51.9194, 19.1451),
-    (r"\bsweden\b", "SE", 60.1282, 18.6435),
-    (r"\bnorway\b", "NO", 60.4720, 8.4689),
-    (r"\bfinland\b", "FI", 61.9241, 25.7482),
-    (r"\bukraine\b", "UA", 48.3794, 31.1656),
-    (r"\brussia\b|\brussian\b", "RU", 61.5240, 105.3188),
-    (r"\bserbia\b", "RS", 44.0165, 21.0059),
-    (r"\bmontenegro\b", "ME", 42.7087, 19.3744),
-
-    (r"\bchina\b|\bprc\b", "CN", 35.8617, 104.1954),
-    (r"\btaiwan\b|\btaipei\b", "TW", 23.6978, 120.9605),
-    (r"\bjapan\b", "JP", 36.2048, 138.2529),
-    (r"\bkorea\b|\bsouth korea\b", "KR", 35.9078, 127.7669),
-    (r"\bindia\b", "IN", 20.5937, 78.9629),
-    (r"\bvietnam\b", "VN", 14.0583, 108.2772),
-    (r"\bindonesia\b", "ID", -0.7893, 113.9213),
-    (r"\bphilippines\b", "PH", 12.8797, 121.7740),
-    (r"\bmalaysia\b", "MY", 4.2105, 101.9758),
-    (r"\bthailand\b", "TH", 15.8700, 100.9925),
-    (r"\bsingapore\b", "SG", 1.3521, 103.8198),
-    (r"\baustralia\b", "AU", -25.2744, 133.7751),
-    (r"\bnew zealand\b", "NZ", -40.9006, 174.8860),
-
-    (r"\bturkey\b|\bturkiye\b", "TR", 38.9637, 35.2433),
-    (r"\biran\b", "IR", 32.4279, 53.6880),
-    (r"\biraq\b", "IQ", 33.2232, 43.6793),
-    (r"\bsaudi\b|\bsaudi arabia\b", "SA", 23.8859, 45.0792),
-    (r"\buae\b|\bunited arab emirates\b", "AE", 23.4241, 53.8478),
-    (r"\bqatar\b", "QA", 25.3548, 51.1839),
-    (r"\bisrael\b", "IL", 31.0461, 34.8516),
-    (r"\bgaza\b|\bwest bank\b|\bpalestin\w*\b", "PS", 31.9522, 35.2332),
-    (r"\byemen\b", "YE", 15.5527, 48.5164),
-    (r"\begypt\b", "EG", 26.8206, 30.8025),
-    (r"\bsudan\b", "SD", 12.8628, 30.2176),
-    (r"\bethiopia\b", "ET", 9.1450, 40.4897),
-    (r"\bkenya\b", "KE", -0.0236, 37.9062),
-    (r"\btanzania\b", "TZ", -6.3690, 34.8888),
-    (r"\buganda\b", "UG", 1.3733, 32.2903),
-    (r"\brwanda\b", "RW", -1.9403, 29.8739),
-    (r"\bburundi\b", "BI", -3.3731, 29.9189),
-
-    (r"\bdrc\b|\bdr congo\b|\bdemocratic republic of the congo\b|\bcongo-kinshasa\b", "CD", -4.0383, 21.7587),
-    (r"\bcongo\b(?!-kinshasa)|\brepublic of the congo\b|\bcongo-brazzaville\b", "CG", -0.2280, 15.8277),
-    (r"\bzambia\b", "ZM", -13.1339, 27.8493),
-    (r"\bdr\.?c\.?\b", "CD", -4.0383, 21.7587),
-    (r"\bbotswana\b", "BW", -22.3285, 24.6849),
-    (r"\bghana\b", "GH", 7.9465, -1.0232),
-    (r"\bnamibia\b", "NA", -22.9576, 18.4904),
-    (r"\bmadagascar\b", "MG", -18.7669, 46.8691),
-    (r"\bmorocco\b", "MA", 31.7917, -7.0926),
-    (r"\balgeria\b", "DZ", 28.0339, 1.6596),
-    (r"\btunisia\b", "TN", 33.8869, 9.5375),
-    (r"\bnigeria\b", "NG", 9.0820, 8.6753),
-    (r"\bsouth africa\b", "ZA", -30.5595, 22.9375),
-    (r"\bmozambique\b", "MZ", -18.6657, 35.5296),
-    (r"\bangola\b", "AO", -11.2027, 17.8739),
-    (r"\bguinea\b", "GN", 9.9456, -9.6966),
-
-    (r"\bchad\b", "TD", 15.4542, 18.7322),
-    (r"\barmenia\b", "AM", 40.0691, 45.0382),
-    (r"\baz\w*\b", "AZ", 40.1431, 47.5769),
-]
-
-_COUNTRY_HINTS_COMPILED: List[Tuple[re.Pattern, str, float, float]] = [
-    (re.compile(pat, re.IGNORECASE), iso2, lat, lon) for pat, iso2, lat, lon in COUNTRY_HINTS
+# NOTE: You MUST fill FEEDS with actual State Dept RSS feed URLs.
+# The directory page is not itself a feed.
+STATE_DEPT_FEEDS: List[str] = [
+    # Example (replace with real feed URLs you choose from https://www.state.gov/rss-feeds/):
+    # "https://www.state.gov/feed/",   # <-- This is NOT guaranteed; pick actual feeds from the directory.
 ]
 
 
-def extract_countries_and_centroid(text: str) -> Tuple[List[str], Optional[Tuple[float, float]]]:
-    """
-    Returns (countries, (lat, lon) or None).
-    - countries: ISO2 codes; can include "EU" placeholder.
-    - centroid: first matched centroid lat/lon.
-    """
-    t = text or ""
-    hits: List[str] = []
-    centroid: Optional[Tuple[float, float]] = None
-    for pat, iso2, lat, lon in _COUNTRY_HINTS_COMPILED:
-        if pat.search(t):
-            if iso2 not in hits:
-                hits.append(iso2)
-            if centroid is None:
-                centroid = (lat, lon)
-    return hits, centroid
-
-
 # ----------------------------
-# HTTP helper (robust)
-# ----------------------------
-
-_SESSION = requests.Session()
-
-def _backoff(attempt: int) -> float:
-    # 0.6, 1.2, 2.4, ... capped
-    return min(6.0, 0.6 * (2 ** attempt))
-
-def http_get(
-    url: str,
-    *,
-    params: Optional[Dict[str, Any]] = None,
-    headers: Optional[Dict[str, str]] = None,
-    timeout: Tuple[float, float] = (5, 20),
-    max_retries: int = 3,
-) -> Optional[requests.Response]:
-    hdrs = dict(DEFAULT_HEADERS)
-    if headers:
-        hdrs.update(headers)
-
-    last_exc: Optional[Exception] = None
-    for attempt in range(max_retries):
-        try:
-            r = _SESSION.get(url, params=params, headers=hdrs, timeout=timeout)
-            if r.status_code in (403, 451):
-                raise SourceBlocked(f"Blocked by {url} (HTTP {r.status_code})")
-            if r.status_code == 429 or 500 <= r.status_code < 600:
-                time.sleep(_backoff(attempt))
-                continue
-            r.raise_for_status()
-            return r
-        except SourceBlocked:
-            # hard block -> skip source
-            return None
-        except requests.RequestException as e:
-            last_exc = e
-            time.sleep(_backoff(attempt))
-            continue
-
-    # Exhausted retries
-    if last_exc:
-        raise last_exc
-    return None
-
-
-# ----------------------------
-# Generic helpers
+# Helpers
 # ----------------------------
 
 def _id(s: str) -> str:
@@ -316,11 +138,12 @@ def _why_it_matters(risks: List[str]) -> str:
 
 def _severity(text: str, risks: List[str]) -> int:
     """
-    Simple heuristic severity score 0-100.
+    Very simple heuristic severity score 0-100.
     """
     t = (text or "").lower()
     score = 25
 
+    # High-impact words
     if any(x in t for x in ["shutdown", "collapse", "ban", "embargo"]):
         score += 40
     elif any(x in t for x in ["strike", "blockade", "attack", "sanction", "halt"]):
@@ -328,6 +151,7 @@ def _severity(text: str, risks: List[str]) -> int:
     elif any(x in t for x in ["delay", "protest", "tighten", "restriction"]):
         score += 10
 
+    # Risk-type modifiers
     if "sanctions" in risks or "conflict" in risks:
         score += 10
     if "policy" in risks:
@@ -336,15 +160,6 @@ def _severity(text: str, risks: List[str]) -> int:
         score += 5
 
     return max(0, min(100, score))
-
-
-def _parse_dt_to_z(dt_str: str) -> str:
-    if not dt_str:
-        return _nowz()
-    try:
-        return dtparse.parse(dt_str).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    except Exception:
-        return _nowz()
 
 
 def _mk_event(
@@ -364,30 +179,20 @@ def _mk_event(
 
     summary = _clean_summary(summary)
     if not summary and title:
+        # fallback so UI never shows blank summaries
         summary = " ".join(title.split()[:28])
 
     text = f"{title} {summary}"
-
     if (not force_include) and (not _is_copper(text)):
         return None
 
     risks = _risk_types(text)
     sev = _severity(text, risks)
+
+    # MVP: no real geocoding yet. Keep placeholder "Global" unless you add NER+geocode later.
+    loc = location or {"name": "Global", "lat": 0.0, "lon": 0.0, "precision": "country"}
+
     why = _why_it_matters(risks)
-
-    countries, centroid = extract_countries_and_centroid(text)
-
-    # Location precedence:
-    # 1) explicit location passed in from ingestor
-    # 2) inferred country centroid
-    # 3) Global fallback
-    if location and isinstance(location, dict) and ("lat" in location and "lon" in location):
-        loc = location
-    elif centroid:
-        lat, lon = centroid
-        loc = {"name": (countries[0] if countries else "Global"), "lat": float(lat), "lon": float(lon), "precision": "country"}
-    else:
-        loc = {"name": "Global", "lat": 0.0, "lon": 0.0, "precision": "global"}
 
     return {
         "id": _id(url + "|" + title),
@@ -397,20 +202,27 @@ def _mk_event(
         "sourceUrl": url,
         "sourceName": source_name,
         "sourceQuality": _quality_from_url(url),
-        "publishedAt": _parse_dt_to_z(published_at),
+        "publishedAt": published_at,
         "materials": ["Copper"],
         "riskType": risks,
         "severity": sev,
-        "countries": countries or (["GLOBAL"] if loc["precision"] == "global" else []),
         "location": loc,
         "tags": sorted(list({*(r.upper() for r in risks), "COPPER"})),
     }
 
 
+def _parse_dt_to_z(dt_str: str) -> str:
+    if not dt_str:
+        return _nowz()
+    try:
+        return dtparse.parse(dt_str).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return _nowz()
+
+
 # ----------------------------
 # Source ingestors
 # ----------------------------
-
 def ingest_mining_rss() -> List[Dict[str, Any]]:
     """
     Mining.com RSS.
@@ -423,13 +235,18 @@ def ingest_mining_rss() -> List[Dict[str, Any]]:
     """
 
     FEED_URLS = [
+        # Most common WordPress RSS locations
         "https://www.mining.com/feed/",
-        "https://www.mining.com/?feed=rss2",
+        "https://www.mining.com/feed",
         "https://mining.com/feed/",
+        "https://mining.com/feed",
+        # Fallback WP query style
+        "https://www.mining.com/?feed=rss2",
         "https://mining.com/?feed=rss2",
     ]
 
     headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GeoMonitorBot/1.0; +https://critical-material-geotracking.onrender.com)",
         "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
@@ -437,15 +254,17 @@ def ingest_mining_rss() -> List[Dict[str, Any]]:
 
     for feed_url in FEED_URLS:
         try:
-            r = http_get(feed_url, headers=headers, timeout=(5, 20))
-            if r is None:
-                # blocked
-                return []
-            feed = feedparser.parse(r.content)
+            r = requests.get(feed_url, timeout=(5, 20), headers=headers)
+            r.raise_for_status()
+
+            feed = feedparser.parse(r.content)  # bytes, not text
             if getattr(feed, "bozo", False):
+                print(f"[Mining.com] RSS parse error (bozo) for {feed_url}: {getattr(feed,'bozo_exception',None)}", flush=True)
                 continue
+
             entries = getattr(feed, "entries", []) or []
             if not entries:
+                print(f"[Mining.com] RSS returned 0 entries for {feed_url}.", flush=True)
                 continue
 
             out: List[Dict[str, Any]] = []
@@ -454,20 +273,30 @@ def ingest_mining_rss() -> List[Dict[str, Any]]:
                 url = getattr(e, "link", "") or ""
                 summary = getattr(e, "summary", "") or ""
                 published = getattr(e, "published", "") or ""
-                ev = _mk_event(title, summary, url, "Mining.com", published)
+
+                published_at = _parse_dt_to_z(published)
+                ev = _mk_event(title, summary, url, "Mining.com", published_at)
                 if ev:
                     out.append(ev)
-            return out
+
+            if out:
+                return out
+            # If feed is reachable but nothing matches copper keywords, still consider it a success.
+            return []
+
         except Exception as e:
             last_err = e
             continue
 
+    # If every endpoint failed, surface a single error for the report (caller will catch it).
     if last_err:
         raise last_err
+
     return []
 
 
 def ingest_gdelt(days: int = 7) -> List[Dict[str, Any]]:
+    # Make copper mandatory so results aren't diluted
     q = (
         "copper AND ("
         "mine OR mining OR smelter OR refinery OR concentrate OR cathode OR "
@@ -487,16 +316,17 @@ def ingest_gdelt(days: int = 7) -> List[Dict[str, Any]]:
         "sort": "DateDesc",
     }
 
-    r = http_get(url, params=params, headers={"Accept": "application/json"})
-    if r is None:
-        return []
+    r = requests.get(url, params=params, timeout=(5, 20), headers={"User-Agent": "geo-monitor/1.0"})
+    r.raise_for_status()
     js = r.json()
+
+    # GDELT can return "status": "error" with HTTP 200
     if js.get("status") == "error":
         raise RuntimeError(f"GDELT error: {js.get('message') or js}")
 
     articles = js.get("articles") or []
     if not articles:
-        return []
+        raise RuntimeError("GDELT returned 0 articles for the query/timespan.")
 
     out: List[Dict[str, Any]] = []
     for a in articles[:100]:
@@ -505,6 +335,7 @@ def ingest_gdelt(days: int = 7) -> List[Dict[str, Any]]:
         summary = a.get("snippet") or ""
         seen = a.get("seendate") or _nowz()
         source = a.get("domain") or "GDELT"
+
         ev = _mk_event(title, summary, url0, source, seen)
         if ev:
             out.append(ev)
@@ -532,23 +363,21 @@ def ingest_gdelt_domain(days: int, domain: str, source_label: str) -> List[Dict[
         "sort": "DateDesc",
     }
 
-    r = http_get(url, params=params, headers={"Accept": "application/json"})
-    if r is None:
-        return []
+    r = requests.get(url, params=params, timeout=(5, 20), headers={"User-Agent": "geo-monitor/1.0"})
+    r.raise_for_status()
     js = r.json()
+
     if js.get("status") == "error":
         raise RuntimeError(f"GDELT error: {js.get('message') or js}")
 
     articles = js.get("articles") or []
-    if not articles:
-        return []
-
     out: List[Dict[str, Any]] = []
     for a in articles[:100]:
         title = a.get("title") or ""
         url0 = a.get("url") or ""
         summary = a.get("snippet") or ""
         seen = a.get("seendate") or _nowz()
+
         ev = _mk_event(title, summary, url0, source_label, seen)
         if ev:
             out.append(ev)
@@ -557,10 +386,13 @@ def ingest_gdelt_domain(days: int, domain: str, source_label: str) -> List[Dict[
 
 
 def scrape_treasury_press_releases() -> List[Dict[str, Any]]:
+    """
+    Official Treasury press releases list page (HTML).
+    Best-effort scrape: extract press release links and titles.
+    """
     url = "https://home.treasury.gov/news/press-releases"
-    r = http_get(url, timeout=(5, 20))
-    if r is None:
-        return []
+    r = requests.get(url, timeout=(5, 20), headers={"User-Agent": "geo-monitor/1.0"})
+    r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "lxml")
     out: List[Dict[str, Any]] = []
@@ -568,23 +400,35 @@ def scrape_treasury_press_releases() -> List[Dict[str, Any]]:
     for a in soup.select("a[href]"):
         href = a.get("href", "")
         text = a.get_text(" ", strip=True)
+
         if not text:
             continue
+
+        # Only keep actual press release detail pages
         if "/news/press-releases/" in href and len(text) > 15:
             full = href if href.startswith("http") else "https://home.treasury.gov" + href
+            # Treasury press releases may matter even if "copper" isn't mentioned.
+            # Keep only if it's geopolicy-relevant OR copper-relevant.
             risks = _risk_types(text)
             force = (risks != ["other"]) or _is_copper(text)
             ev = _mk_event(text, "", full, "U.S. Treasury", _nowz(), force_include=force)
             if ev:
                 out.append(ev)
 
-    return out[:80]
+    return out[:60]
 
 
 def scrape_ofac_recent_actions() -> List[Dict[str, Any]]:
+    """
+    OFAC RSS is retired; use the official Recent Actions page.
+    This source is known to be slow sometimes, so it MUST be best-effort and never crash ingestion.
+    """
     url = "https://ofac.treasury.gov/recent-actions"
-    r = http_get(url, timeout=(5, 15))
-    if r is None:
+    try:
+        r = requests.get(url, timeout=(5, 15), headers={"User-Agent": "geo-monitor/1.0"})
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"[OFAC] skipped due to request error: {e}", flush=True)
         return []
 
     soup = BeautifulSoup(r.text, "lxml")
@@ -593,49 +437,63 @@ def scrape_ofac_recent_actions() -> List[Dict[str, Any]]:
     for a in soup.select("a[href]"):
         href = a.get("href", "")
         text = a.get_text(" ", strip=True)
+
         if not text or len(text) <= 12:
             continue
+
+        # Recent Actions detail pages
         if "/recent-actions/" in href:
             full = href if href.startswith("http") else "https://ofac.treasury.gov" + href
+            # OFAC is inherently sanctions/policy-oriented; include even if "copper" isn't in the title.
             ev = _mk_event(text, "", full, "OFAC", _nowz(), force_include=True)
             if ev:
                 out.append(ev)
 
-    return out[:80]
+    return out[:60]
 
 
 def ingest_state_rss() -> List[Dict[str, Any]]:
+    """
+    State Dept provides RSS feeds, but you must choose actual feed URLs and put them in STATE_DEPT_FEEDS.
+    If empty, return [] without error.
+    """
     if not STATE_DEPT_FEEDS:
+        print("[StateDept] No RSS feeds configured (STATE_DEPT_FEEDS empty). Skipping.", flush=True)
         return []
 
     out: List[Dict[str, Any]] = []
     for feed_url in STATE_DEPT_FEEDS:
         try:
-            r = http_get(feed_url, headers={"Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8"})
-            if r is None:
-                continue
-            feed = feedparser.parse(r.content)
-            for e in getattr(feed, "entries", [])[:200]:
+            feed = feedparser.parse(feed_url)
+            for e in getattr(feed, "entries", [])[:80]:
                 title = getattr(e, "title", "") or ""
                 url = getattr(e, "link", "") or ""
                 summary = getattr(e, "summary", "") or ""
                 published = getattr(e, "published", "") or ""
-                ev = _mk_event(title, summary, url, "U.S. State Dept", published)
+                published_at = _parse_dt_to_z(published)
+
+                ev = _mk_event(title, summary, url, "U.S. State Dept", published_at)
                 if ev:
                     out.append(ev)
-        except Exception:
-            continue
+        except Exception as e:
+            print(f"[StateDept] feed failed {feed_url}: {e}", flush=True)
+
     return out
 
 
 def ingest_eu_consilium_press_releases_rss() -> List[Dict[str, Any]]:
+    """EU Council (consilium.europa.eu) press releases RSS feed."""
     feed_url = "https://www.consilium.europa.eu/en/rss/pressreleases.ashx"
-    r = http_get(feed_url, headers={"Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8"})
-    if r is None:
-        return []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GeoMonitorBot/1.0; +https://critical-material-geotracking.onrender.com)",
+        "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    r = requests.get(feed_url, timeout=(5, 20), headers=headers)
+    r.raise_for_status()
 
     feed = feedparser.parse(r.content)
     if getattr(feed, "bozo", False):
+        print(f"[EU Council] RSS parse error (bozo): {getattr(feed,'bozo_exception',None)}", flush=True)
         return []
 
     out: List[Dict[str, Any]] = []
@@ -644,20 +502,30 @@ def ingest_eu_consilium_press_releases_rss() -> List[Dict[str, Any]]:
         url = getattr(e, "link", "") or ""
         summary = getattr(e, "summary", "") or ""
         published = getattr(e, "published", "") or ""
-        ev = _mk_event(title, summary, url, "EU Council", published, force_include=True)
+        published_at = _parse_dt_to_z(published)
+
+        # EU Council press releases are inherently policy/geopolitics; include even without "copper" in title.
+        # We'll still let _mk_event drop obvious spam + non-policy items via risk typing.
+        ev = _mk_event(title, summary, url, "EU Council", published_at, force_include=True)
         if ev:
             out.append(ev)
+
     return out
 
 
 def ingest_uk_ofsi_blog_feed() -> List[Dict[str, Any]]:
+    """UK Office of Financial Sanctions Implementation (OFSI) blog feed."""
     feed_url = "https://ofsi.blog.gov.uk/feed/"
-    r = http_get(feed_url, headers={"Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8"})
-    if r is None:
-        return []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GeoMonitorBot/1.0; +https://critical-material-geotracking.onrender.com)",
+        "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    r = requests.get(feed_url, timeout=(5, 20), headers=headers)
+    r.raise_for_status()
 
     feed = feedparser.parse(r.content)
     if getattr(feed, "bozo", False):
+        print(f"[UK OFSI] RSS/Atom parse error (bozo): {getattr(feed,'bozo_exception',None)}", flush=True)
         return []
 
     out: List[Dict[str, Any]] = []
@@ -666,66 +534,53 @@ def ingest_uk_ofsi_blog_feed() -> List[Dict[str, Any]]:
         url = getattr(e, "link", "") or ""
         summary = getattr(e, "summary", "") or ""
         published = getattr(e, "published", "") or ""
-        ev = _mk_event(title, summary, url, "UK OFSI", published, force_include=True)
+        published_at = _parse_dt_to_z(published)
+
+        # OFSI is sanctions/compliance oriented; always include.
+        ev = _mk_event(title, summary, url, "UK OFSI", published_at, force_include=True)
         if ev:
             out.append(ev)
+
     return out
 
 
 # ----------------------------
-# Master run
+# Orchestration (safe / fault tolerant)
 # ----------------------------
 
 def run_all(days: int = 7) -> List[Dict[str, Any]]:
     """
-    Run all enabled sources and return merged events.
-    Attaches run_all.last_report for debugging.
+    Runs ingestion across all enabled sources in a fault-tolerant way.
+    - Never raises on a single source failure.
+    - Stores per-source status in run_all.last_report.
     """
     sources: List[Tuple[str, Callable[[], List[Dict[str, Any]]]]] = [
-        ("GDELT", lambda: ingest_gdelt(days=days)),
+        ("GDELT", lambda: ingest_gdelt(days)),
         ("Mining.com RSS", ingest_mining_rss),
-        ("U.S. Treasury", scrape_treasury_press_releases),
-        ("OFAC", scrape_ofac_recent_actions),
-        ("EU Council", ingest_eu_consilium_press_releases_rss),
-        ("UK OFSI", ingest_uk_ofsi_blog_feed),
-        ("U.S. State Dept", ingest_state_rss),
-        ("Reuters via GDELT", lambda: ingest_gdelt_domain(days=days, domain="reuters.com", source_label="Reuters")),
+        ("EU Council PR RSS", ingest_eu_consilium_press_releases_rss),
+        ("UK OFSI Blog", ingest_uk_ofsi_blog_feed),
+        # ("Mining.com via GDELT", lambda: ingest_gdelt_domain(days, "mining.com", "Mining.com")),
+        ("Treasury PR", scrape_treasury_press_releases),
+        ("OFAC Recent Actions", scrape_ofac_recent_actions),
+        ("State Dept RSS", ingest_state_rss),
     ]
 
-    merged: Dict[str, Dict[str, Any]] = {}
+    events: List[Dict[str, Any]] = []
     report: List[Dict[str, Any]] = []
 
     for name, fn in sources:
-        t0 = time.time()
         try:
-            events = fn() or []
-            for e in events:
-                merged[e["id"]] = e
-
-            status = "ok" if events else "empty"
-            report.append({
-                "source": name,
-                "status": status,
-                "events": len(events),
-                "error": None,
-                "duration_ms": int((time.time() - t0) * 1000),
-            })
-        except SourceBlocked as e:
-            report.append({
-                "source": name,
-                "status": "blocked",
-                "events": 0,
-                "error": str(e),
-                "duration_ms": int((time.time() - t0) * 1000),
-            })
+            items = fn()
+            report.append({"name": name, "events": len(items), "error": None})
+            events.extend(items)
         except Exception as e:
-            report.append({
-                "source": name,
-                "status": "error",
-                "events": 0,
-                "error": str(e),
-                "duration_ms": int((time.time() - t0) * 1000),
-            })
+            report.append({"name": name, "events": 0, "error": f"{type(e).__name__}: {e}"})
+            print(f"[{name}] skipped due to error: {e}", flush=True)
 
+    # de-dupe by id
+    by_id: Dict[str, Dict[str, Any]] = {e["id"]: e for e in events}
+    out = list(by_id.values())
+
+    # attach report for API response
     run_all.last_report = report  # type: ignore[attr-defined]
-    return sorted(list(merged.values()), key=lambda x: x.get("publishedAt", ""), reverse=True)
+    return out
